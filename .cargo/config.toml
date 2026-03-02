@@ -1,0 +1,5 @@
+[target.armv7-unknown-linux-musleabihf]
+# We use the rust-lld linker which is bundled with Rust,
+# but we tell it to behave like a musl linker.
+linker = "rust-lld"
+rustflags = ["-C", "target-feature=+crt-static"]

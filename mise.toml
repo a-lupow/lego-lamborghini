@@ -1,0 +1,10 @@
+[tools]
+rust = "latest"
+
+[tasks.build-luckfox]
+description = "Build for Luckfox Ultra W (armv7-unknown-linux-musleabihf)"
+run = "cross build --release --target armv7-unknown-linux-musleabihf"
+
+[tasks.build]
+description = "Build for the current platform"
+run = "distrobox enter dev-ubuntu -- cargo build"
