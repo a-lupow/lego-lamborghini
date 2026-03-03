@@ -1,0 +1,41 @@
+{
+  "name": "lamborghini-rust",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  // Podman-specific settings
+  "runArgs": [
+    "--userns=keep-id",
+    "--security-opt=label=disable",
+    // Workspace bind mount with SELinux relabel
+    "--volume=${localWorkspaceFolder}:/workspace:Z",
+    // Podman socket exposed as docker.sock for cross
+    "--volume=${localEnv:XDG_RUNTIME_DIR}/podman/podman.sock:/var/run/docker.sock"
+  ],
+  "containerEnv": {
+    "HOME": "/root"
+  },
+  "workspaceFolder": "/workspace",
+  "features": {},
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "rust-analyzer.server.path": "/usr/local/cargo/bin/rust-analyzer",
+        "rust-analyzer.cargo.buildScripts.enable": true,
+        "rust-analyzer.checkOnSave.command": "clippy",
+        "editor.formatOnSave": true,
+        "[rust]": {
+          "editor.defaultFormatter": "rust-lang.rust-analyzer"
+        }
+      },
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "vadimcn.vscode-lldb",
+        "tamasfe.even-better-toml",
+        "serayuzgur.crates",
+        "fill-labs.dependi"
+      ]
+    }
+  },
+}

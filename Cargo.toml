@@ -5,12 +5,13 @@ edition = "2021"
 
 [dependencies]
 tokio = { version = "1.35", features = ["full"] }
-btleplug = "0.11.8"
 bluer = { version = "0.17", features = ["bluetoothd"] }
 dbus = { version = "0.9", features = ["vendored"] }
 futures = "0.3.32"
 sdl2 = { version= "0.37", default-features = false, features = ["bundled", "static-link"] }
 bitflags = "2.11.0"
+uuid = { version = "1", features = ["v4"] }
+log = "0.4.29"
 
 [profile.dev]
 opt-level = 0
