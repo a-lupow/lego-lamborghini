@@ -3,6 +3,7 @@ mod hub_controller;
 mod logger;
 
 use bluer::Device;
+use clap::{crate_name, crate_version, Arg, Command};
 use log::{debug, info, warn};
 use sdl2::{
     controller::{Axis, Button},
@@ -21,8 +22,39 @@ static LOGGER: SimpleLogger = SimpleLogger;
 
 #[tokio::main]
 async fn main() {
+    let matches = Command::new(crate_name!())
+        .version(crate_version!())
+        .about("Control a Bluetooth-connected Lamborghini model car using a game controller.")
+        .arg(
+            Arg::new("log-level")
+                .short('l')
+                .long("log-level")
+                .value_parser(["error", "warn", "info", "debug", "trace"])
+                .default_value("warn")
+                .help("Set the logging level"),
+        )
+        .arg(
+            Arg::new("hub")
+                .short('t')
+                .long("target")
+                .default_value(HUB_BT_MAC)
+                .help("Bluetooth MAC address of the hub"),
+        )
+        .get_matches();
+
     log::set_logger(&LOGGER).unwrap();
-    log::set_max_level(log::LevelFilter::Info);
+
+    // Set the log level based on the command-line argument.
+    log::set_max_level(
+        match matches.get_one::<String>("log-level").unwrap().as_str() {
+            "error" => log::LevelFilter::Error,
+            "warn" => log::LevelFilter::Warn,
+            "info" => log::LevelFilter::Info,
+            "debug" => log::LevelFilter::Debug,
+            "trace" => log::LevelFilter::Trace,
+            _ => log::LevelFilter::Warn, // Default to Warn if somehow an invalid value is provided
+        },
+    );
 
     let ctrl_c_signal = tokio::signal::ctrl_c();
 
