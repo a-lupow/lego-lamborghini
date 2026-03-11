@@ -35,7 +35,8 @@ impl BtManager {
         let mut connected_device: Option<Device> = None;
 
         info!(
-            "Attempting to connect to a known device, {} devices found",
+            "{}: Attempting to connect to a known device, {} devices found",
+            device_name,
             devices.len()
         );
 
@@ -121,6 +122,15 @@ impl BtManager {
                                     "{}: Failed to connect to device: {}, looking for a new one",
                                     device_name, e
                                 );
+                                // Remove the device from the adapter so BlueZ re-surfaces it as a
+                                // DeviceAdded event on its next advertisement, allowing the
+                                // discover_stream arm to pick it up and retry.
+                                if let Err(remove_err) = self.adapter.remove_device(address).await {
+                                    warn!(
+                                        "{}: Failed to remove device {} after failed connection: {}",
+                                        device_name, address, remove_err
+                                    );
+                                }
                                 continue;
                             }
                         }
@@ -156,6 +166,14 @@ impl BtManager {
                                 "{}: Failed to connect to device: {}, looking for a new one",
                                 device_name, e
                             );
+                            // Remove the device from the adapter so BlueZ re-surfaces it as a
+                            // DeviceAdded event on its next advertisement, allowing a clean retry.
+                            if let Err(remove_err) = self.adapter.remove_device(address).await {
+                                warn!(
+                                    "{}: Failed to remove device {} after failed connection: {}",
+                                    device_name, address, remove_err
+                                );
+                            }
                             continue;
                         }
                     }
@@ -166,6 +184,12 @@ impl BtManager {
 
     /**
      * Attempts to connect to the provided Bluetooth device, pairing and trusting it if necessary.
+     *
+     * When explicit_pair is true, pair() is called before connect(). This is required for devices
+     * that use SSP pairing (e.g. a DualSense controller). For devices that use Just Works pairing
+     * (e.g. a LEGO hub), explicit_pair should be false so that BlueZ negotiates pairing implicitly
+     * during connect() — calling pair() explicitly on such devices triggers a formal pairing
+     * procedure that they reject with Authentication Failed.
      */
     async fn attempt_connection(
         &self,
@@ -186,16 +210,6 @@ impl BtManager {
             device.pair().await?;
         }
 
-        // Make sure the device is trusted so it will not disconnect.
-        if !is_trusted {
-            info!(
-                "{}: Device {} is not trusted, setting it to trusted...",
-                device_name,
-                device.address()
-            );
-            device.set_trusted(true).await?;
-        }
-
         // Connect if not already connected.
         if !is_connected {
             info!(
@@ -204,6 +218,16 @@ impl BtManager {
                 device.address()
             );
             device.connect().await?;
+        }
+
+        // Make sure the device is trusted so it will not disconnect.
+        if !is_trusted {
+            info!(
+                "{}: Device {} is not trusted, setting it to trusted...",
+                device_name,
+                device.address()
+            );
+            device.set_trusted(true).await?;
         }
 
         // Register the device address.

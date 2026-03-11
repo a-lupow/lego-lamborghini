@@ -215,7 +215,7 @@ async fn do_main() {
             }
 
             // Apply events to the hub controller.
-            hub_controller
+            match hub_controller
                 .drive(
                     if thrust_value > 0.0 {
                         (thrust_value * 100.0) as i8
@@ -226,7 +226,16 @@ async fn do_main() {
                     drive_state,
                 )
                 .await
-                .unwrap();
+            {
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(
+                        "Failed to send drive command: {}. Attempting to reconnect...",
+                        e
+                    );
+                    break;
+                }
+            }
         }
     }
 }
