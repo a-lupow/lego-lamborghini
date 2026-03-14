@@ -1,11 +1,14 @@
 use std::error::Error;
 
-use bluer::{Adapter, AdapterEvent, Device, DeviceEvent, DeviceProperty, Session};
+use bluer::{agent::Agent, Adapter, AdapterEvent, Device, DeviceEvent, DeviceProperty, Session};
 use futures::{lock::Mutex, StreamExt};
 use log::{debug, info, warn};
 
 pub struct BtManager {
     pub adapter: Adapter,
+
+    // Kept alive for the duration of the manager — dropping it unregisters the agent.
+    _agent_handle: bluer::agent::AgentHandle,
 
     devices: Mutex<Vec<String>>,
 }
@@ -15,9 +18,11 @@ impl BtManager {
         // Initiate the session.
         let session = Session::new().await.unwrap();
         let adapter = session.default_adapter().await.unwrap();
+        let agent_handle = session.register_agent(Agent::default()).await.unwrap();
 
         BtManager {
             adapter,
+            _agent_handle: agent_handle,
             devices: Mutex::new(Vec::new()),
         }
     }
@@ -184,12 +189,6 @@ impl BtManager {
 
     /**
      * Attempts to connect to the provided Bluetooth device, pairing and trusting it if necessary.
-     *
-     * When explicit_pair is true, pair() is called before connect(). This is required for devices
-     * that use SSP pairing (e.g. a DualSense controller). For devices that use Just Works pairing
-     * (e.g. a LEGO hub), explicit_pair should be false so that BlueZ negotiates pairing implicitly
-     * during connect() — calling pair() explicitly on such devices triggers a formal pairing
-     * procedure that they reject with Authentication Failed.
      */
     async fn attempt_connection(
         &self,
@@ -207,7 +206,17 @@ impl BtManager {
                 device_name,
                 device.address()
             );
-            device.pair().await?;
+            if let Err(e) = device.pair().await {
+                if e.to_string().contains("Already Exists") {
+                    info!(
+                        "{}: Device {} is already paired, continuing...",
+                        device_name,
+                        device.address()
+                    );
+                } else {
+                    return Err(Box::from(e));
+                }
+            }
         }
 
         // Connect if not already connected.

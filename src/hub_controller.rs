@@ -20,6 +20,13 @@ bitflags! {
     }
 }
 
+#[derive(PartialEq)]
+pub struct DriveCommand {
+    pub speed: i8,
+    pub steer: i8,
+    pub mode: DriveState,
+}
+
 pub struct HubController {
     device: Device,
     char_uuid: Uuid,
@@ -27,6 +34,8 @@ pub struct HubController {
     last_command_time: time::Instant,
 
     characteristic: Option<bluer::gatt::remote::Characteristic>,
+
+    last_drive_command: Option<DriveCommand>,
 }
 
 static HUB_CHAR_UUID: &str = "00001624-1212-efde-1623-785feabcd123";
@@ -40,6 +49,7 @@ impl HubController {
             // Use standard delay of 50ms.
             delay_between_commands: 50,
             last_command_time: Instant::now() - Duration::from_millis(50),
+            last_drive_command: None,
         }
     }
 
@@ -51,7 +61,7 @@ impl HubController {
         for service in self.device.services().await? {
             for characteristic in service.characteristics().await? {
                 if characteristic.uuid().await? == self.char_uuid {
-                    println!("Found target characteristic: {}", self.char_uuid);
+                    debug!("Found target characteristic: {}", self.char_uuid);
                     self.characteristic = Some(characteristic);
 
                     return Ok(());
@@ -87,7 +97,7 @@ impl HubController {
             }
 
             let sleep_time = Duration::from_millis(self.delay_between_commands) - duration_since;
-            println!("Waiting for {:?} before sending next command", sleep_time);
+            debug!("Waiting for {:?} before sending next command", sleep_time);
             tokio::time::sleep(sleep_time).await;
         }
 
@@ -96,7 +106,7 @@ impl HubController {
             .as_ref()
             .ok_or("Characteristic not found")?;
 
-        println!("Sending command: {:?}", command);
+        debug!("Sending command: {:?}", command);
 
         // WriteOp::Command is "write without response", which is the default.
         characteristic.write(command).await?;
@@ -119,12 +129,18 @@ impl HubController {
     /**
      * Sends a drive command to the hub with the specified speed, steer, and mode.
      */
-    pub async fn drive(
-        &mut self,
-        speed: i8,
-        steer: i8,
-        mode: DriveState,
-    ) -> Result<(), Box<dyn Error>> {
+    pub async fn drive(&mut self, command: DriveCommand) -> Result<(), Box<dyn Error>> {
+        // Make sure the last drive command is different.
+        if self
+            .last_drive_command
+            .as_ref()
+            .is_some_and(|last_command| *last_command == command)
+        {
+            debug!("Drive command did not change, skipping");
+
+            return Ok(());
+        }
+
         self.send_command(
             &[
                 0x0d,
@@ -136,9 +152,9 @@ impl HubController {
                 0x00,
                 0x03,
                 0x00,
-                speed as u8,
-                steer as u8,
-                mode.bits(),
+                command.speed as u8,
+                command.steer as u8,
+                command.mode.bits(),
                 0x00,
             ],
             true,

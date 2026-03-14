@@ -12,7 +12,7 @@ use sdl2::{
 
 use crate::{
     bt_device::BtManager,
-    hub_controller::{DriveState, HubController},
+    hub_controller::{DriveCommand, DriveState, HubController},
     logger::SimpleLogger,
 };
 
@@ -20,7 +20,7 @@ static HUB_BT_MAC: &str = "0C:4B:EE:EA:76:F7"; // TODO: Make this configurable.
 static CONTROLLER_PREFIX: &str = "DualSense Wireless Controller";
 static LOGGER: SimpleLogger = SimpleLogger;
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
     let matches = Command::new(crate_name!())
         .version(crate_version!())
@@ -30,7 +30,7 @@ async fn main() {
                 .short('l')
                 .long("log-level")
                 .value_parser(["error", "warn", "info", "debug", "trace"])
-                .default_value("warn")
+                .default_value("info")
                 .help("Set the logging level"),
         )
         .arg(
@@ -248,15 +248,15 @@ async fn do_main() {
 
             // Apply events to the hub controller.
             match hub_controller
-                .drive(
-                    if thrust_value > 0.0 {
+                .drive(DriveCommand {
+                    speed: if thrust_value > 0.0 {
                         (thrust_value * 100.0) as i8
                     } else {
                         -(reverse_value * 100.0) as i8
                     },
-                    (steer_value * 100.0) as i8,
-                    drive_state,
-                )
+                    steer: (steer_value * 100.0) as i8,
+                    mode: drive_state,
+                })
                 .await
             {
                 Ok(_) => {}
