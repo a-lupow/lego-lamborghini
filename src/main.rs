@@ -2,12 +2,20 @@ mod bt_device;
 mod hub_controller;
 mod logger;
 
-use bluer::Device;
 use clap::{crate_name, crate_version, Arg, Command};
+use rkyv::{Archive, Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
 use log::{debug, info, warn};
-use sdl2::{
-    controller::{Axis, Button},
-    event::Event,
+use tokio::{
+    net::UdpSocket,
+    sync::{broadcast, watch},
+    time,
 };
 
 use crate::{
@@ -17,10 +25,10 @@ use crate::{
 };
 
 static HUB_BT_MAC: &str = "0C:4B:EE:EA:76:F7"; // TODO: Make this configurable.
-static CONTROLLER_PREFIX: &str = "DualSense Wireless Controller";
-static LOGGER: SimpleLogger = SimpleLogger;
+static HUB_DEVICE_NAME: &str = "hub";
+static LOGGER: std::sync::OnceLock<SimpleLogger> = std::sync::OnceLock::new();
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let matches = Command::new(crate_name!())
         .version(crate_version!())
@@ -42,9 +50,9 @@ async fn main() {
         )
         .get_matches();
 
-    log::set_logger(&LOGGER).unwrap();
+    let logger = LOGGER.get_or_init(SimpleLogger::new);
+    log::set_logger(logger).unwrap();
 
-    // Set the log level based on the command-line argument.
     log::set_max_level(
         match matches.get_one::<String>("log-level").unwrap().as_str() {
             "error" => log::LevelFilter::Error,
@@ -52,220 +60,291 @@ async fn main() {
             "info" => log::LevelFilter::Info,
             "debug" => log::LevelFilter::Debug,
             "trace" => log::LevelFilter::Trace,
-            _ => log::LevelFilter::Warn, // Default to Warn if somehow an invalid value is provided
+            _ => log::LevelFilter::Warn,
         },
     );
 
-    let ctrl_c_signal = tokio::signal::ctrl_c();
+    // Single source of truth for the latest drive command.
+    let (drive_tx, drive_rx) = watch::channel::<Option<DriveCommand>>(None);
+    let (control_response_sender, control_response_receiver) =
+        broadcast::channel::<ControlMessage>(32);
 
-    tokio::select! {
-        _ = do_main() => {
-            debug!("Main task completed, exiting.");
-        },
-        _ = ctrl_c_signal => {
-            info!("Application terminated by user.");
+    let bt_manager = BtManager::new().await;
+    let bt_mac = matches.get_one::<String>("target").unwrap().clone();
+
+    tokio::join!(
+        run_bt_task(bt_mac, bt_manager, control_response_sender, drive_rx),
+        run_control_task(control_response_receiver, drive_tx),
+    );
+}
+
+#[derive(Archive, Serialize, Deserialize)]
+struct DriveCommandRaw {
+    pub speed: i8,
+    pub steer: i8,
+    pub mode: u8,
+}
+
+impl Into<DriveCommand> for DriveCommandRaw {
+    fn into(self) -> DriveCommand {
+        DriveCommand {
+            speed: self.speed,
+            steer: self.steer,
+            mode: DriveState::from_bits_truncate(self.mode),
         }
     }
 }
 
-/**
- * Main application logic, including connection management and the main control loop.
- */
-async fn do_main() {
-    let manager = BtManager::new().await;
+#[derive(Archive, Deserialize)]
+enum ControlCommand {
+    Drive(DriveCommandRaw),
+    Ping,
+}
+
+#[derive(Debug, Clone, Archive, Serialize)]
+enum ReadyStatus {
+    WaitingForHub,
+    Connecting,
+    Handshaking,
+    Ready,
+}
+
+#[derive(Debug, Clone, Archive, Serialize)]
+struct Status {
+    ready: ReadyStatus,
+}
+
+#[derive(Debug, Clone, Archive, Serialize)]
+enum ControlMessage {
+    Info(Status),
+}
+
+async fn run_control_task(
+    mut message_receiver: broadcast::Receiver<ControlMessage>,
+    drive_tx: watch::Sender<Option<DriveCommand>>,
+) {
+    let socket = Arc::new(UdpSocket::bind("0.0.0.0:8080").await.unwrap());
+    info!("UDP listening on {}", socket.local_addr().unwrap());
+
+    let mut buffer = vec![0u8; 4096];
+    let mut peers: HashMap<SocketAddr, Instant> = HashMap::new();
+    let mut last_status: Option<Status> = None;
 
     loop {
-        // Simultaneously attempt to connect to both the controller and hub, and wait for either to complete or for a Ctrl+C signal to cancel the attempt.
-        // If either connection fails, we will retry the entire process.
-        let (controller_result, hub_result) = tokio::select! {
-            results = async { tokio::join!(
-                manager.connect("Controller", async |device: &Device| {
-                    let name = device.name().await.unwrap_or_default();
+        tokio::select! {
+            Ok(message) = message_receiver.recv() => {
+                let ControlMessage::Info(status) = &message;
+                last_status = Some(status.clone());
 
-                    if let Some(name) = name {
-                        // Since any controller is supported, match by prefix to avoid accidentally connecting to other BT devices.
-                        return name.starts_with(CONTROLLER_PREFIX);
+                // Evict peers that haven't been active for a while.
+                peers.retain(|peer, last_seen| {
+                    if last_seen.elapsed().as_secs() > 300 {
+                        info!("Evicted inactive peer: {}", peer);
+                        false
+                    } else {
+                        true
                     }
+                });
 
-                    return false;
-                }),
-                manager.connect("Hub", async |device: &Device| {
-                    // Simply match by MAC address.
-                    return device.address().to_string() == HUB_BT_MAC;
-                }),
-            ) } => results,
-            _ = tokio::signal::ctrl_c() => {
-                info!("Connection attempt cancelled by user.");
-                manager.disconnect_all().await.unwrap();
-                return;
+                let message_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&message).unwrap();
+                for peer in peers.keys() {
+                    if let Err(error) = socket.send_to(&message_bytes, peer).await {
+                        warn!("Failed to send message to {}: {}", peer, error);
+                    }
+                }
+            },
+
+            Ok((len, peer_addr)) = socket.recv_from(&mut buffer) => {
+                if !peers.contains_key(&peer_addr) {
+                    info!("New peer connected: {}", peer_addr);
+                }
+                peers.insert(peer_addr, Instant::now());
+
+                tokio::spawn(handle_udp_packet(
+                    socket.clone(),
+                    last_status.clone(),
+                    buffer[..len].to_vec(),
+                    peer_addr,
+                    drive_tx.clone(),
+                ));
+            },
+
+            else => {
+                warn!("Control task encountered an error, exiting");
+                break;
             }
-        };
+        }
+    }
+}
 
-        if let Err(e) = controller_result {
-            warn!("Failed to connect to controller: {}. Retrying...", e);
-            manager.disconnect_all().await.unwrap();
+async fn handle_udp_packet(
+    socket: Arc<UdpSocket>,
+    last_status: Option<Status>,
+    data: Vec<u8>,
+    peer: SocketAddr,
+    drive_tx: watch::Sender<Option<DriveCommand>>,
+) {
+    let command = match rkyv::from_bytes::<ControlCommand, rkyv::rancor::Error>(&data) {
+        Ok(cmd) => cmd,
+        Err(error) => {
+            warn!("Failed to deserialize UDP packet from {}: {}", peer, error);
+            return;
+        }
+    };
+
+    match command {
+        ControlCommand::Ping => {
+            let status = last_status.unwrap_or(Status {
+                ready: ReadyStatus::WaitingForHub,
+            });
+            info!(
+                "Received ping from {}, responding with status: {:?}",
+                peer, status,
+            );
+            let message_bytes =
+                rkyv::to_bytes::<rkyv::rancor::Error>(&ControlMessage::Info(status)).unwrap();
+            if let Err(error) = socket.send_to(&message_bytes, peer).await {
+                warn!("Failed to send ping response to {}: {}", peer, error);
+            }
+        }
+
+        ControlCommand::Drive(raw) => {
+            let drive: DriveCommand = raw.into();
+
+            debug!(
+                "Received drive command from {}: speed {}, steer {}, mode {}",
+                peer, drive.speed, drive.steer, drive.mode
+            );
+
+            // Send it over the channel.
+            drive_tx.send(Some(drive)).ok();
+        }
+    }
+}
+
+async fn run_bt_task(
+    hub_mac: String,
+    mut manager: BtManager,
+    control_response: broadcast::Sender<ControlMessage>,
+    mut drive_rx: watch::Receiver<Option<DriveCommand>>,
+) {
+    debug!("Initiating BT control loop task");
+
+    loop {
+        control_response
+            .send(ControlMessage::Info(Status {
+                ready: ReadyStatus::WaitingForHub,
+            }))
+            .ok();
+
+        if manager.has_connection(HUB_DEVICE_NAME).await {
+            info!("Already connected to hub, skipping connection step");
             continue;
         }
 
-        let hub = match hub_result {
-            Ok(hub) => hub,
-            Err(e) => {
-                warn!("Failed to connect to hub: {}. Retrying...", e);
-                manager.disconnect_all().await.unwrap();
-                continue;
-            }
-        };
+        if let Err(error) = manager.forget_device(HUB_BT_MAC).await {
+            info!(
+                "Failed to forget hub device (it might not have been remembered yet): {}",
+                error
+            );
+        }
 
-        // Initialize the hub controller.
-        let mut hub_controller = HubController::new(hub);
+        let result = manager
+            .connect(HUB_DEVICE_NAME, async |device| {
+                device.address().to_string() == hub_mac
+            })
+            .await;
+
+        if let Err(error) = &result {
+            warn!("Failed to connect to hub: {}", error);
+            continue;
+        }
+
+        control_response
+            .send(ControlMessage::Info(Status {
+                ready: ReadyStatus::Connecting,
+            }))
+            .ok();
+
+        debug!(
+            "Successfully connected to hub: {}",
+            result.unwrap().address()
+        );
+
+        let hub = manager.get_device(HUB_DEVICE_NAME).await;
+
+        let mut hub_controller = HubController::new(hub.unwrap());
 
         match hub_controller.connect().await {
             Ok(_) => info!("Connected to hub controller"),
             Err(e) => {
                 warn!("Failed to connect to hub controller: {}. Retrying...", e);
-
-                // Reset all connections to ensure a clean state for the next attempt.
                 manager.disconnect_all().await.unwrap();
                 continue;
             }
         }
+
+        control_response
+            .send(ControlMessage::Info(Status {
+                ready: ReadyStatus::Handshaking,
+            }))
+            .ok();
 
         info!("Initiating handshake with hub controller");
         match hub_controller.handshake().await {
             Ok(_) => info!("Handshake successful"),
             Err(e) => {
                 warn!("Handshake failed: {}. Retrying...", e);
-
-                // Reset all connections to ensure a clean state for the next attempt.
                 manager.disconnect_all().await.unwrap();
                 continue;
             }
         }
 
-        // At this point we have successfully connected to both the controller and hub, and completed the handshake. We can now enter the main control loop.
-        let sdl_context = sdl2::init().unwrap();
-        let controller_subsystem = sdl_context.game_controller().unwrap();
-
-        // Open every SDL2-enumerated game controller and keep the handles alive
-        // in a Vec — dropping a GameController handle closes it immediately, which
-        // would stop events from being delivered before the loop even starts.
-        let _controllers: Vec<_> = (0..controller_subsystem.num_joysticks().unwrap_or(0))
-            .filter(|&i| controller_subsystem.is_game_controller(i))
-            .filter_map(|i| match controller_subsystem.open(i) {
-                Ok(c) => {
-                    info!("Opened controller {}: {}", i, c.name());
-                    Some(c)
-                }
-                Err(e) => {
-                    warn!("Failed to open controller {}: {}", i, e);
-                    None
-                }
-            })
-            .collect();
-
         info!("Entering main control loop");
 
-        const DEAD_ZONE: u16 = 500;
-        let mut thrust_value = 0.0;
-        let mut reverse_value = 0.0;
-        let mut steer_value = 0.0;
+        control_response
+            .send(ControlMessage::Info(Status {
+                ready: ReadyStatus::Ready,
+            }))
+            .ok();
 
-        let mut drive_state = DriveState::empty();
-        drive_state.set(DriveState::TurboOff, true);
-        drive_state.set(DriveState::Break, false);
-        drive_state.set(DriveState::LightsOff, false);
+        // Discard any command that was queued before we were ready to handle it.
+        drive_rx.mark_unchanged();
 
-        let mut event_pump = sdl_context.event_pump().unwrap();
-        'running: loop {
-            for event in event_pump.poll_iter() {
-                // Process SDL2 events, including controller input.
-                match event {
-                    Event::Quit { .. } => break 'running,
+        #[allow(unused_assignments)]
+        let mut last_send_time = Instant::now();
 
-                    // Handle controller input events
-                    Event::ControllerAxisMotion {
-                        timestamp: _,
-                        which: _,
-                        axis,
-                        value,
-                    } => {
-                        // Store state for all buttons.
-                        match axis {
-                            Axis::TriggerRight => {
-                                thrust_value = (value as f32) / 32767.0; // Normalize to [0, 1]
-                            }
-                            Axis::TriggerLeft => {
-                                reverse_value = (value as f32) / 32767.0; // Normalize to [0, 1]
-                            }
-                            Axis::LeftX => {
-                                steer_value = if value.unsigned_abs() > DEAD_ZONE {
-                                    (value as f32) / 32767.0 // Normalize to [-1, 1]
-                                } else {
-                                    0.0 // Within dead zone, treat as neutral
-                                };
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    Event::ControllerButtonDown {
-                        timestamp: _,
-                        which: _,
-                        button,
-                    } => {
-                        match button {
-                            Button::A => {
-                                drive_state.set(DriveState::Break, true);
-                            }
-
-                            Button::X => {
-                                // Toggle turbo mode on/off.
-                                drive_state.toggle(DriveState::TurboOff);
-                            }
-
-                            Button::Y => {
-                                // Toggle lights on/off.
-                                drive_state.toggle(DriveState::LightsOff);
-                            }
-
-                            _ => {}
-                        }
-                    }
-
-                    Event::ControllerButtonUp {
-                        timestamp: _,
-                        which: _,
-                        button,
-                    } => match button {
-                        Button::A => {
-                            drive_state.set(DriveState::Break, false);
-                        }
-                        _ => {}
-                    },
-                    _ => {}
-                }
+        loop {
+            if drive_rx.changed().await.is_err() {
+                info!("Drive command channel closed, exiting control loop");
+                return;
             }
 
-            // Apply events to the hub controller.
-            match hub_controller
-                .drive(DriveCommand {
-                    speed: if thrust_value > 0.0 {
-                        (thrust_value * 100.0) as i8
-                    } else {
-                        -(reverse_value * 100.0) as i8
-                    },
-                    steer: (steer_value * 100.0) as i8,
-                    mode: drive_state,
-                })
-                .await
-            {
-                Ok(_) => {}
-                Err(e) => {
+            // Borrow and clone the latest value.
+            let command = drive_rx.borrow_and_update().clone();
+
+            if let Some(command) = command {
+                info!(
+                    "Sending command speed: {}, steer: {}",
+                    command.speed, command.steer
+                );
+
+                last_send_time = Instant::now();
+                if let Err(error) = hub_controller.drive(command).await {
                     warn!(
                         "Failed to send drive command: {}. Attempting to reconnect...",
-                        e
+                        error
                     );
                     break;
+                }
+
+                // Rate-limit: wait 50 ms before the next send.
+                let duration = Instant::now().duration_since(last_send_time);
+
+                if duration.as_millis() < 50 {
+                    let sleep_duration = Duration::from_millis(50) - duration;
+                    debug!("Sleeping for {:?} to rate-limit commands", sleep_duration);
+                    time::sleep(sleep_duration).await;
                 }
             }
         }

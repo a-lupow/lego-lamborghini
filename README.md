@@ -17,7 +17,6 @@ I intentionally avoided releasing the exact handshake sequence to the public, so
 |-----------|-------|
 | LEGO Technic Control+ set | Tested with the Lamborghini Revuelto (42214) |
 | SoC with BLE | e.g. Luckfox Pico Ultra W, Raspberry Pi, or any ARMv7/ARM64 Linux board with Bluetooth |
-| PlayStation controller | DualSense or DualShock 4 — paired over BLE |
 
 The MAC address of your LEGO hub must be set in `src/main.rs`:
 

@@ -20,7 +20,13 @@ bitflags! {
     }
 }
 
-#[derive(PartialEq)]
+impl std::fmt::Display for DriveState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+
+#[derive(Clone, PartialEq)]
 pub struct DriveCommand {
     pub speed: i8,
     pub steer: i8,
@@ -35,7 +41,7 @@ pub struct HubController {
 
     characteristic: Option<bluer::gatt::remote::Characteristic>,
 
-    last_drive_command: Option<DriveCommand>,
+    pub last_drive_command: Option<DriveCommand>,
 }
 
 static HUB_CHAR_UUID: &str = "00001624-1212-efde-1623-785feabcd123";
@@ -78,24 +84,13 @@ impl HubController {
     async fn send_command(
         &mut self,
         command: &[u8],
-        drop_if_busy: bool,
+        ignore_timing: bool,
     ) -> Result<(), Box<dyn Error>> {
         // Ensure we respect the delay between commands.
         let now = Instant::now();
         let duration_since = now.duration_since(self.last_command_time);
 
-        if duration_since < Duration::from_millis(self.delay_between_commands) {
-            // This is required to make sure we get responsive behaviour from the hub when controlled.
-            // A better solution would be to store it in a queue and send it as soon as the delay has passed, if the command is still relevant.
-            // Since that is not the priority right now, I'll address it later.
-            if drop_if_busy {
-                debug!(
-                    "Dropping command {:?} because we're still within the delay period",
-                    command
-                );
-                return Ok(());
-            }
-
+        if !ignore_timing && duration_since < Duration::from_millis(self.delay_between_commands) {
             let sleep_time = Duration::from_millis(self.delay_between_commands) - duration_since;
             debug!("Waiting for {:?} before sending next command", sleep_time);
             tokio::time::sleep(sleep_time).await;
@@ -128,16 +123,20 @@ impl HubController {
 
     /**
      * Sends a drive command to the hub with the specified speed, steer, and mode.
+     *
+     * Timing is managed externally — the caller is expected to invoke this on a fixed
+     * 50ms ticker so that the hub always receives commands at the right cadence.
+     * Deduplication is still performed here: if the command hasn't changed since the
+     * last successful send, the BLE write is skipped to avoid unnecessary traffic.
      */
     pub async fn drive(&mut self, command: DriveCommand) -> Result<(), Box<dyn Error>> {
-        // Make sure the last drive command is different.
+        // Skip the write if the command hasn't changed since last time.
         if self
             .last_drive_command
             .as_ref()
-            .is_some_and(|last_command| *last_command == command)
+            .is_some_and(|last| *last == command)
         {
-            debug!("Drive command did not change, skipping");
-
+            debug!("Drive command did not change, skipping BLE write");
             return Ok(());
         }
 
@@ -160,6 +159,8 @@ impl HubController {
             true,
         )
         .await?;
+
+        self.last_drive_command = Some(command);
 
         Ok(())
     }

@@ -1,7 +1,7 @@
-use std::error::Error;
+use std::{collections::HashMap, error::Error};
 
 use bluer::{agent::Agent, Adapter, AdapterEvent, Device, DeviceEvent, DeviceProperty, Session};
-use futures::{lock::Mutex, StreamExt};
+use futures::StreamExt;
 use log::{debug, info, warn};
 
 pub struct BtManager {
@@ -10,7 +10,8 @@ pub struct BtManager {
     // Kept alive for the duration of the manager — dropping it unregisters the agent.
     _agent_handle: bluer::agent::AgentHandle,
 
-    devices: Mutex<Vec<String>>,
+    // Hash map keyed by device name, the values are device addresses.
+    devices: HashMap<String, String>,
 }
 
 impl BtManager {
@@ -23,74 +24,31 @@ impl BtManager {
         BtManager {
             adapter,
             _agent_handle: agent_handle,
-            devices: Mutex::new(Vec::new()),
+            devices: HashMap::new(),
         }
     }
 
-    /**
-     * Attempts to connect to a Bluetooth device that matches the provided filter function.
-     */
-    async fn attempt_connection_known(
-        &self,
-        device_name: &str,
-        filter: impl AsyncFn(&Device) -> bool,
-    ) -> Result<Option<Device>, Box<dyn Error>> {
-        // List available devices.
-        let devices = self.adapter.device_addresses().await?;
-        let mut connected_device: Option<Device> = None;
-
-        info!(
-            "{}: Attempting to connect to a known device, {} devices found",
-            device_name,
-            devices.len()
-        );
-
-        for address in devices {
-            let device = self.adapter.device(address)?;
-
-            if !filter(&device).await {
-                continue;
-            }
-
-            info!(
-                "{}: Device {} matched the filter",
-                device_name,
-                device.address()
-            );
-            connected_device = Some(device);
-            break;
-        }
-
-        let Some(connected_device) = connected_device else {
-            info!("No devices found that match the filter.");
-            return Ok(None);
-        };
-
-        // Attempt to connect to the found device.
-        match self
-            .attempt_connection(device_name, &connected_device)
-            .await
-        {
-            Ok(_) => {
-                info!("Device connected successfully.");
-                return Ok(Some(connected_device));
-            }
-            Err(e) => {
-                warn!("Failed to connect to device: {}, attempting discovery", e);
-                return Ok(None);
-            }
-        }
+    pub async fn forget_device(&self, device_address: &str) -> Result<(), Box<dyn Error>> {
+        info!("Forgetting device with address {}", device_address);
+        self.adapter.remove_device(device_address.parse()?).await?;
+        Ok(())
     }
 
-    async fn attempt_connection_discover(
-        &self,
+    pub async fn connect(
+        &mut self,
         device_name: &str,
         filter: impl AsyncFn(&Device) -> bool,
     ) -> Result<Device, Box<dyn Error>> {
-        // Attempt to discover the device.
-        let known_devices = self.adapter.device_addresses().await?;
+        info!("{}: Starting a new connect attempt", device_name);
 
+        // Attempt to discover the device.
+        info!("{}: Fetching known device addresses...", device_name);
+        let known_devices = self.adapter.device_addresses().await?;
+        info!("{}: Got {} known devices", device_name, known_devices.len());
+
+        info!("{}: Starting discovery stream...", device_name);
         let mut discover_stream = self.adapter.discover_devices().await?;
+        info!("{}: Discovery stream started", device_name);
         let mut known_event_stream = futures::stream::SelectAll::new();
 
         // Subscribe to known devices events.
@@ -102,43 +60,44 @@ impl BtManager {
             }
 
             info!(
-                "{}: Watching known device {} for connections",
+                "{}: Subscribing to events for known device {}",
                 device_name, address
             );
-
             let events = device.events().await?.map(move |event| (address, event));
+            info!("{}: Subscribed to events for {}", device_name, address);
             known_event_stream.push(events);
         }
+
+        info!("{}: Entering event loop", device_name);
 
         loop {
             tokio::select! {
                 Some((address, event)) = known_event_stream.next() => {
                     if let DeviceEvent::PropertyChanged(DeviceProperty::Connected(true)) = event {
                         info!("{}: Known device {} connected, attempting to register it", device_name, address);
-                        let device = self.adapter.device(address)?;
 
-                        match self.attempt_connection(device_name, &device).await {
-                            Ok(_) => {
-                                info!("{}: Device connected successfully.", device_name);
-                                return Ok(device);
-                            }
-                            Err(e) => {
+                        let device = self.adapter.device(address)?;
+                        let result = self.attempt_connection(device_name, &device).await;
+
+                        if let Err(err) = result {
+                            warn!(
+                                "{}: Failed to connect to device: {}, looking for a new one",
+                                device_name, err
+                            );
+                            // Remove the device from the adapter so BlueZ re-surfaces it as a
+                            // DeviceAdded event on its next advertisement, allowing the
+                            // discover_stream arm to pick it up and retry.
+                            if let Err(remove_err) = self.adapter.remove_device(address).await {
                                 warn!(
-                                    "{}: Failed to connect to device: {}, looking for a new one",
-                                    device_name, e
+                                    "{}: Failed to remove device {} after failed connection: {}",
+                                    device_name, address, remove_err
                                 );
-                                // Remove the device from the adapter so BlueZ re-surfaces it as a
-                                // DeviceAdded event on its next advertisement, allowing the
-                                // discover_stream arm to pick it up and retry.
-                                if let Err(remove_err) = self.adapter.remove_device(address).await {
-                                    warn!(
-                                        "{}: Failed to remove device {} after failed connection: {}",
-                                        device_name, address, remove_err
-                                    );
-                                }
-                                continue;
                             }
+                            continue;
                         }
+
+                        info!("{}: Device connected successfully.", device_name);
+                        return Ok(device);
                     }
                 }
 
@@ -159,6 +118,19 @@ impl BtManager {
 
                     if !filter(&device).await {
                         continue;
+                    }
+
+                    // BlueZ may have auto-connected the device before our discover
+                    // event fired. If so, skip the pair/connect dance and go straight
+                    // to registering it — attempt_connection handles this gracefully,
+                    // but calling is_connected() here avoids the stale is_paired read.
+                    if device.is_connected().await? {
+                        info!(
+                            "{}: Device {} appeared via discover but is already connected, registering it",
+                            device_name, address
+                        );
+                        self.attempt_connection(device_name, &device).await?;
+                        return Ok(device);
                     }
 
                     match self.attempt_connection(device_name, &device).await {
@@ -183,6 +155,12 @@ impl BtManager {
                         }
                     }
                 }
+
+                // If a cancellation receiver was provided, listen for cancellation messages.
+                // Some(_) = cancel_token. => {
+                //     info!("{}: Connect attempt cancelled, exiting", device_name);
+                //     return Err("Connection attempt cancelled".into());
+                // }
             }
         }
     }
@@ -191,13 +169,11 @@ impl BtManager {
      * Attempts to connect to the provided Bluetooth device, pairing and trusting it if necessary.
      */
     async fn attempt_connection(
-        &self,
+        &mut self,
         device_name: &str,
         device: &Device,
     ) -> Result<(), Box<dyn Error>> {
-        let is_connected = device.is_connected().await?;
         let is_paired = device.is_paired().await?;
-        let is_trusted = device.is_trusted().await?;
 
         // Pair and trust if not already paired.
         if !is_paired {
@@ -219,6 +195,8 @@ impl BtManager {
             }
         }
 
+        let is_connected = device.is_connected().await?;
+
         // Connect if not already connected.
         if !is_connected {
             info!(
@@ -229,14 +207,15 @@ impl BtManager {
             device.connect().await?;
         }
 
-        // Make sure the device is trusted so it will not disconnect.
-        if !is_trusted {
-            info!(
-                "{}: Device {} is not trusted, setting it to trusted...",
+        // Trust is idempotent — don't bother reading is_trusted first.
+        info!("{}: Trusting {}...", device_name, device.address());
+        if let Err(e) = device.set_trusted(true).await {
+            warn!(
+                "{}: Failed to set device {} as trusted (non-fatal): {}",
                 device_name,
-                device.address()
+                device.address(),
+                e
             );
-            device.set_trusted(true).await?;
         }
 
         // Register the device address.
@@ -247,40 +226,59 @@ impl BtManager {
         );
 
         self.devices
-            .lock()
-            .await
-            .push(device.address().to_string().into());
+            .insert(device_name.to_string(), device.address().to_string().into());
 
         return Ok(());
     }
 
-    pub async fn connect(
-        &self,
-        device_name: &str,
-        filter: impl AsyncFn(&Device) -> bool,
-    ) -> Result<Device, Box<dyn Error>> {
-        // First attempt to connect to a known device.
-        if let Some(device) = self.attempt_connection_known(device_name, &filter).await? {
-            return Ok(device);
+    pub async fn get_device(&self, device_name: &str) -> Result<Device, Box<dyn Error>> {
+        let address = self.devices.get(device_name);
+
+        if address.is_none() {
+            return Err("Device not found".into());
         }
 
-        // If that fails, attempt to discover the device and connect to it.
-        return self.attempt_connection_discover(device_name, filter).await;
+        return Ok(self.adapter.device(address.unwrap().parse()?)?);
+    }
+
+    /// Disconnects from a device with a given name, if such is registered.
+    pub async fn disconnect(&mut self, device_name: &str) -> Result<(), Box<dyn Error>> {
+        let device = self.devices.get(device_name);
+
+        if let None = device {
+            return Err("Device not found".into());
+        }
+
+        let address = device.unwrap();
+
+        // Attempt to disconnect.
+        let device = self.adapter.device(address.parse()?)?;
+
+        if device.is_connected().await? {
+            device.disconnect().await?;
+        }
+
+        // Remove the key.
+        self.devices.remove(device_name);
+
+        return Ok(());
     }
 
     /**
      * Disconnects all devices that were previously connected via this manager.
      */
-    pub async fn disconnect_all(&self) -> Result<(), Box<dyn Error>> {
-        let devices = self.devices.lock().await.clone();
+    pub async fn disconnect_all(&mut self) -> Result<(), Box<dyn Error>> {
+        let devices: Vec<String> = self.devices.keys().cloned().collect();
 
-        for address in devices {
-            let device = self.adapter.device(address.parse()?)?;
-            if device.is_connected().await? {
-                device.disconnect().await?;
-            }
+        for name in devices {
+            self.disconnect(&name).await?;
         }
 
         return Ok(());
+    }
+
+    /// Returns true if the manager has a device with the key connected.
+    pub async fn has_connection(&self, device_name: &str) -> bool {
+        return self.devices.contains_key(device_name);
     }
 }
