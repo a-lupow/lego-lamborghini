@@ -1,4 +1,4 @@
-# Lamborghini Rust
+# Lamborghini Rust FPV
 
 An unofficial, open-source Rust controller for the **LEGO Technic Lamborghini 42214** (or any LEGO Control+ hub-based set), 
 allowing you to drive it with a PlayStation DualSense (or DualShock) controller over Bluetooth from a Linux SoC such as the 
@@ -10,6 +10,37 @@ but this project uses reverse-engineering and custom BLE commands to bypass that
 I intentionally avoided releasing the exact handshake sequence to the public, so you'll have to come up with the 
 `AUTHENTICATION_SEQUENCE` yourself in case you want to use this code. 
 
+
+## Architecture
+
+```mermaid
+graph TB
+    subgraph Operator["Operator device (phone)"]
+        CTRL["DualSense\n(Bluetooth)"]
+        APP["FPV app\n───────────────────\nVideo viewer · Drive client\nUDP :8080"]
+    end
+
+    subgraph Car["Car build"]
+        subgraph SoC["SoC — Luckfox Pico Ultra W (ARMv7 Linux)"]
+            FPV["FPV process\n(streams camera)\n───────────────────\nrkipc"]
+            LR["lamborghini-rust (this repo)\n───────────────────\nBlueZ · UDP :8080"]
+        end
+        CAM["Camera module\n(MIS5001)"]
+        ESP["ESP32-C3\n(BT co-processor)\n───────────────────\nHCI over UART"]
+    end
+
+    LEGO["LEGO Technic Hub\n(Control+, BLE GATT)"]
+
+    CTRL -- "BT (controller input)" --> APP
+    APP -- "UDP (DriveCommand · Ping)" --> LR
+    LR -- "UDP (ControlMessage · Status)" --> APP
+    CAM --> FPV
+    FPV -- "Wi-Fi (video stream)" --> APP
+    LR -- "BlueZ / HCI" --> ESP
+    ESP -- "BLE GATT write\n(0x0d motor command)" --> LEGO
+```
+
+---
 
 ## Hardware Setup
 
