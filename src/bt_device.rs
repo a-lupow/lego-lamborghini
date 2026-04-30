@@ -28,12 +28,14 @@ impl BtManager {
         }
     }
 
+    /// Disconnects device from the adapter managed by the manager.
     pub async fn forget_device(&self, device_address: &str) -> Result<(), Box<dyn Error>> {
         info!("Forgetting device with address {}", device_address);
         self.adapter.remove_device(device_address.parse()?).await?;
         Ok(())
     }
 
+    /// Connects to a Bluetooth device with given filter.
     pub async fn connect(
         &mut self,
         device_name: &str,
@@ -226,6 +228,7 @@ impl BtManager {
         Ok(())
     }
 
+    /// Gets a connected device by its logical name, if such is registered.
     pub async fn get_device(&self, device_name: &str) -> Result<Device, Box<dyn Error>> {
         let address = self.devices.get(device_name).ok_or("Device not found")?;
 
