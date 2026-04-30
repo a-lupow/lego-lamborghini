@@ -24,7 +24,7 @@ use crate::{
     logger::SimpleLogger,
 };
 
-static HUB_BT_MAC: &str = "0C:4B:EE:EA:76:F7"; // TODO: Make this configurable.
+static DEFAULT_HUB_BT_MAC: &str = "0C:4B:EE:EA:76:F7";
 static HUB_DEVICE_NAME: &str = "hub";
 static LOGGER: std::sync::OnceLock<SimpleLogger> = std::sync::OnceLock::new();
 
@@ -42,27 +42,33 @@ async fn main() {
                 .help("Set the logging level"),
         )
         .arg(
-            Arg::new("hub")
+            Arg::new("target")
                 .short('t')
                 .long("target")
-                .default_value(HUB_BT_MAC)
+                .default_value(DEFAULT_HUB_BT_MAC)
                 .help("Bluetooth MAC address of the hub"),
         )
         .get_matches();
 
     let logger = LOGGER.get_or_init(SimpleLogger::new);
-    log::set_logger(logger).unwrap();
+    if let Err(error) = log::set_logger(logger) {
+        eprintln!("Failed to initialize logger: {}", error);
+        return;
+    }
 
-    log::set_max_level(
-        match matches.get_one::<String>("log-level").unwrap().as_str() {
-            "error" => log::LevelFilter::Error,
-            "warn" => log::LevelFilter::Warn,
-            "info" => log::LevelFilter::Info,
-            "debug" => log::LevelFilter::Debug,
-            "trace" => log::LevelFilter::Trace,
-            _ => log::LevelFilter::Warn,
-        },
-    );
+    let log_level = matches
+        .get_one::<String>("log-level")
+        .map(|value| value.as_str())
+        .unwrap_or("info");
+
+    log::set_max_level(match log_level {
+        "error" => log::LevelFilter::Error,
+        "warn" => log::LevelFilter::Warn,
+        "info" => log::LevelFilter::Info,
+        "debug" => log::LevelFilter::Debug,
+        "trace" => log::LevelFilter::Trace,
+        _ => log::LevelFilter::Warn,
+    });
 
     // Single source of truth for the latest drive command.
     let (drive_tx, drive_rx) = watch::channel::<Option<DriveCommand>>(None);
@@ -123,8 +129,18 @@ async fn run_control_task(
     mut message_receiver: broadcast::Receiver<ControlMessage>,
     drive_tx: watch::Sender<Option<DriveCommand>>,
 ) {
-    let socket = Arc::new(UdpSocket::bind("0.0.0.0:8080").await.unwrap());
-    info!("UDP listening on {}", socket.local_addr().unwrap());
+    let socket = match UdpSocket::bind("0.0.0.0:8080").await {
+        Ok(socket) => Arc::new(socket),
+        Err(error) => {
+            warn!("Failed to bind UDP socket on 0.0.0.0:8080: {}", error);
+            return;
+        }
+    };
+
+    match socket.local_addr() {
+        Ok(addr) => info!("UDP listening on {}", addr),
+        Err(error) => warn!("Failed to read UDP socket local address: {}", error),
+    }
 
     let mut buffer = vec![0u8; 4096];
     let mut peers: HashMap<SocketAddr, Instant> = HashMap::new();
@@ -146,7 +162,14 @@ async fn run_control_task(
                     }
                 });
 
-                let message_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&message).unwrap();
+                let message_bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(&message) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        warn!("Failed to serialize control message: {}", error);
+                        continue;
+                    }
+                };
+
                 for peer in peers.keys() {
                     if let Err(error) = socket.send_to(&message_bytes, peer).await {
                         warn!("Failed to send message to {}: {}", peer, error);
@@ -202,7 +225,13 @@ async fn handle_udp_packet(
                 peer, status,
             );
             let message_bytes =
-                rkyv::to_bytes::<rkyv::rancor::Error>(&ControlMessage::Info(status)).unwrap();
+                match rkyv::to_bytes::<rkyv::rancor::Error>(&ControlMessage::Info(status)) {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        warn!("Failed to serialize ping response for {}: {}", peer, error);
+                        return;
+                    }
+                };
             if let Err(error) = socket.send_to(&message_bytes, peer).await {
                 warn!("Failed to send ping response to {}: {}", peer, error);
             }
@@ -242,7 +271,7 @@ async fn run_bt_task(
             continue;
         }
 
-        if let Err(error) = manager.forget_device(HUB_BT_MAC).await {
+        if let Err(error) = manager.forget_device(&hub_mac).await {
             info!(
                 "Failed to forget hub device (it might not have been remembered yet): {}",
                 error
@@ -266,20 +295,26 @@ async fn run_bt_task(
             }))
             .ok();
 
-        debug!(
-            "Successfully connected to hub: {}",
-            result.unwrap().address()
-        );
+        let hub = match result {
+            Ok(device) => {
+                debug!("Successfully connected to hub: {}", device.address());
+                device
+            }
+            Err(_) => continue,
+        };
 
-        let hub = manager.get_device(HUB_DEVICE_NAME).await;
-
-        let mut hub_controller = HubController::new(hub.unwrap());
+        let mut hub_controller = HubController::new(hub);
 
         match hub_controller.connect().await {
             Ok(_) => info!("Connected to hub controller"),
             Err(e) => {
                 warn!("Failed to connect to hub controller: {}. Retrying...", e);
-                manager.disconnect_all().await.unwrap();
+                if let Err(error) = manager.disconnect_all().await {
+                    warn!(
+                        "Failed to disconnect devices after controller setup error: {}",
+                        error
+                    );
+                }
                 continue;
             }
         }
@@ -295,7 +330,12 @@ async fn run_bt_task(
             Ok(_) => info!("Handshake successful"),
             Err(e) => {
                 warn!("Handshake failed: {}. Retrying...", e);
-                manager.disconnect_all().await.unwrap();
+                if let Err(error) = manager.disconnect_all().await {
+                    warn!(
+                        "Failed to disconnect devices after handshake error: {}",
+                        error
+                    );
+                }
                 continue;
             }
         }

@@ -9,12 +9,10 @@ use std::time::{self, Duration, Instant};
 use uuid::Uuid;
 
 bitflags! {
-    /**
-     * DriveState represents the various states the Lamborghini Hub can be in while driving.
-     */
+    /// Drive mode flags sent to the LEGO hub with each drive command.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub struct DriveState: u8 {
-        const Break = 1;
+        const Brake = 1;
         const TurboOff = 1 << 1;
         const LightsOff = 1 << 2;
     }
@@ -35,7 +33,7 @@ pub struct DriveCommand {
 
 pub struct HubController {
     device: Device,
-    char_uuid: Uuid,
+    characteristic_uuid: Uuid,
     delay_between_commands: u64,
     last_command_time: time::Instant,
 
@@ -44,13 +42,15 @@ pub struct HubController {
     pub last_drive_command: Option<DriveCommand>,
 }
 
-static HUB_CHAR_UUID: &str = "00001624-1212-efde-1623-785feabcd123";
+static HUB_CHARACTERISTIC_UUID: &str = "00001624-1212-efde-1623-785feabcd123";
 
 impl HubController {
     pub fn new(device: Device) -> Self {
         HubController {
             device,
-            char_uuid: Uuid::parse_str(HUB_CHAR_UUID).expect("Invalid characteristic UUID"),
+            characteristic_uuid: Uuid::parse_str(HUB_CHARACTERISTIC_UUID).unwrap_or_else(|error| {
+                panic!("Invalid characteristic UUID {HUB_CHARACTERISTIC_UUID}: {error}")
+            }),
             characteristic: None,
             // Use standard delay of 50ms.
             delay_between_commands: 50,
@@ -59,15 +59,14 @@ impl HubController {
         }
     }
 
-    /**
-     * Discovers the required GATT characteristic for communication.
-     * Bluetooth connection and pairing are handled externally by BtManager.
-     */
+    /// Discover the GATT characteristic used to send commands to the hub.
+    ///
+    /// Bluetooth connection, pairing, and trust are handled by `BtManager`.
     pub async fn connect(&mut self) -> Result<(), Box<dyn Error>> {
         for service in self.device.services().await? {
             for characteristic in service.characteristics().await? {
-                if characteristic.uuid().await? == self.char_uuid {
-                    debug!("Found target characteristic: {}", self.char_uuid);
+                if characteristic.uuid().await? == self.characteristic_uuid {
+                    debug!("Found target characteristic: {}", self.characteristic_uuid);
                     self.characteristic = Some(characteristic);
 
                     return Ok(());
@@ -78,9 +77,7 @@ impl HubController {
         return Err("Characteristic not found".into());
     }
 
-    /**
-     * Sends a command to the hub, ensuring that we respect the required delay between commands.
-     */
+    /// Send a raw command to the hub while respecting the minimum inter-command delay.
     async fn send_command(
         &mut self,
         command: &[u8],
@@ -110,9 +107,7 @@ impl HubController {
         Ok(())
     }
 
-    /**
-     * Performs the handshake sequence by sending a series of authentication commands to the hub.
-     */
+    /// Perform the authentication handshake required by the hub.
     pub async fn handshake(&mut self) -> Result<(), Box<dyn Error>> {
         for command in AUTHENTICATION_SEQUENCE {
             self.send_command(command, false).await?;
@@ -121,14 +116,13 @@ impl HubController {
         Ok(())
     }
 
-    /**
-     * Sends a drive command to the hub with the specified speed, steer, and mode.
-     *
-     * Timing is managed externally — the caller is expected to invoke this on a fixed
-     * 50ms ticker so that the hub always receives commands at the right cadence.
-     * Deduplication is still performed here: if the command hasn't changed since the
-     * last successful send, the BLE write is skipped to avoid unnecessary traffic.
-     */
+    /// Send a drive command to the hub.
+    ///
+    /// Timing is managed externally. The caller is expected to invoke this on a fixed
+    /// 50 ms cadence so the hub receives updates at a stable rate.
+    ///
+    /// Deduplication is still performed here: if the command has not changed since the
+    /// last successful send, the BLE write is skipped to avoid unnecessary traffic.
     pub async fn drive(&mut self, command: DriveCommand) -> Result<(), Box<dyn Error>> {
         // Skip the write if the command hasn't changed since last time.
         if self

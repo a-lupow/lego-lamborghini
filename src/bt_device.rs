@@ -10,13 +10,13 @@ pub struct BtManager {
     // Kept alive for the duration of the manager — dropping it unregisters the agent.
     _agent_handle: bluer::agent::AgentHandle,
 
-    // Hash map keyed by device name, the values are device addresses.
+    // Device addresses keyed by logical device name.
     devices: HashMap<String, String>,
 }
 
 impl BtManager {
     pub async fn new() -> Self {
-        // Initiate the session.
+        // Initialize the BlueZ session and adapter.
         let session = Session::new().await.unwrap();
         let adapter = session.default_adapter().await.unwrap();
         let agent_handle = session.register_agent(Agent::default()).await.unwrap();
@@ -41,7 +41,7 @@ impl BtManager {
     ) -> Result<Device, Box<dyn Error>> {
         info!("{}: Starting a new connect attempt", device_name);
 
-        // Attempt to discover the device.
+        // Gather known devices and start discovery.
         info!("{}: Fetching known device addresses...", device_name);
         let known_devices = self.adapter.device_addresses().await?;
         info!("{}: Got {} known devices", device_name, known_devices.len());
@@ -120,10 +120,10 @@ impl BtManager {
                         continue;
                     }
 
-                    // BlueZ may have auto-connected the device before our discover
-                    // event fired. If so, skip the pair/connect dance and go straight
-                    // to registering it — attempt_connection handles this gracefully,
-                    // but calling is_connected() here avoids the stale is_paired read.
+                    // BlueZ may have auto-connected the device before the discovery
+                    // event was delivered. If so, skip straight to registration.
+                    // `attempt_connection` handles this gracefully, but checking
+                    // `is_connected()` here avoids relying on a stale `is_paired` read.
                     if device.is_connected().await? {
                         info!(
                             "{}: Device {} appeared via discover but is already connected, registering it",
@@ -156,18 +156,13 @@ impl BtManager {
                     }
                 }
 
-                // If a cancellation receiver was provided, listen for cancellation messages.
-                // Some(_) = cancel_token. => {
-                //     info!("{}: Connect attempt cancelled, exiting", device_name);
-                //     return Err("Connection attempt cancelled".into());
-                // }
+                // Cancellation support can be added here in the future if connect
+                // attempts need to become externally abortable.
             }
         }
     }
 
-    /**
-     * Attempts to connect to the provided Bluetooth device, pairing and trusting it if necessary.
-     */
+    /// Pair, connect, trust, and register the provided Bluetooth device.
     async fn attempt_connection(
         &mut self,
         device_name: &str,
@@ -175,7 +170,7 @@ impl BtManager {
     ) -> Result<(), Box<dyn Error>> {
         let is_paired = device.is_paired().await?;
 
-        // Pair and trust if not already paired.
+        // Pair first if needed.
         if !is_paired {
             info!(
                 "{}: Device {} is not paired, attempting to pair...",
@@ -197,7 +192,7 @@ impl BtManager {
 
         let is_connected = device.is_connected().await?;
 
-        // Connect if not already connected.
+        // Connect if needed.
         if !is_connected {
             info!(
                 "{}: Device {} is not connected, attempting to connect...",
@@ -218,7 +213,7 @@ impl BtManager {
             );
         }
 
-        // Register the device address.
+        // Record the device address under its logical name.
         info!(
             "{}: Device {} connected successfully, registering it",
             device_name,
@@ -228,45 +223,33 @@ impl BtManager {
         self.devices
             .insert(device_name.to_string(), device.address().to_string().into());
 
-        return Ok(());
+        Ok(())
     }
 
     pub async fn get_device(&self, device_name: &str) -> Result<Device, Box<dyn Error>> {
-        let address = self.devices.get(device_name);
+        let address = self.devices.get(device_name).ok_or("Device not found")?;
 
-        if address.is_none() {
-            return Err("Device not found".into());
-        }
-
-        return Ok(self.adapter.device(address.unwrap().parse()?)?);
+        Ok(self.adapter.device(address.parse()?)?)
     }
 
     /// Disconnects from a device with a given name, if such is registered.
     pub async fn disconnect(&mut self, device_name: &str) -> Result<(), Box<dyn Error>> {
-        let device = self.devices.get(device_name);
+        let address = self.devices.get(device_name).ok_or("Device not found")?;
 
-        if let None = device {
-            return Err("Device not found".into());
-        }
-
-        let address = device.unwrap();
-
-        // Attempt to disconnect.
+        // Disconnect if the device is still connected.
         let device = self.adapter.device(address.parse()?)?;
 
         if device.is_connected().await? {
             device.disconnect().await?;
         }
 
-        // Remove the key.
+        // Remove the entry from the registry.
         self.devices.remove(device_name);
 
-        return Ok(());
+        Ok(())
     }
 
-    /**
-     * Disconnects all devices that were previously connected via this manager.
-     */
+    /// Disconnects all devices that were previously connected via the manager.
     pub async fn disconnect_all(&mut self) -> Result<(), Box<dyn Error>> {
         let devices: Vec<String> = self.devices.keys().cloned().collect();
 
@@ -274,11 +257,11 @@ impl BtManager {
             self.disconnect(&name).await?;
         }
 
-        return Ok(());
+        Ok(())
     }
 
     /// Returns true if the manager has a device with the key connected.
     pub async fn has_connection(&self, device_name: &str) -> bool {
-        return self.devices.contains_key(device_name);
+        self.devices.contains_key(device_name)
     }
 }
